@@ -1,0 +1,19 @@
+{
+  "name": "shei_ki",
+  "version": "1.0.0",
+  "description": "Shei-ki RFID checker Discord bot (webhook receiver)",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "deploy-commands": "node deploy-commands.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.3.1",
+    "express": "^4.21.2"
+  }
+}
