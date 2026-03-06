@@ -16,7 +16,6 @@ const {
 } = require("discord.js");
 
 const app = express();
-// Railway/ngrok run behind proxies; this makes req.ip and https detection correct.
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "256kb" }));
 
@@ -29,13 +28,9 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID;
 const WEBHOOK_KEY = process.env.WEBHOOK_KEY || "";
 
-if (!LOG_CHANNEL_ID || !ADMIN_CHANNEL_ID) {
-  console.warn("⚠️ Falta LOG_CHANNEL_ID o ADMIN_CHANNEL_ID en .env");
-}
-
-// ====== Estado en memoria ======
+// ===== Estado =====
 const sessions = new Map(); // uid -> session
-const recentEvents = new Map(); // eventId -> timestampMs (dedupe)
+const recentEvents = new Map(); // dedupe
 const DEDUPE_WINDOW_MS = 15_000;
 
 function cleanupDedupe() {
@@ -57,7 +52,6 @@ function fmtDuration(ms) {
 }
 
 function parseFechaHoraToMs(fecha, hora) {
-  // Espera dd/MM/yyyy y HH:mm:ss
   try {
     const [dd, mm, yyyy] = String(fecha).split("/").map(Number);
     const [HH, MM, SS] = String(hora).split(":").map(Number);
@@ -75,12 +69,10 @@ async function getLogChannel() {
 async function postLog(embed) {
   const ch = await getLogChannel();
   if (!ch) {
-    console.warn("⚠️ No pude obtener el canal de logs. Revisa LOG_CHANNEL_ID y permisos.");
+    console.warn("⚠️ No pude obtener canal logs. Revisa LOG_CHANNEL_ID y permisos.");
     return;
   }
-  await ch.send({ embeds: [embed] }).catch((e) => {
-    console.error("❌ Error enviando embed al canal:", e?.message || e);
-  });
+  await ch.send({ embeds: [embed] }).catch((e) => console.error("❌ send error:", e?.message || e));
 }
 
 async function dm(discordId, text) {
@@ -189,18 +181,9 @@ async function closeSession(uid, closedBy, reason = "") {
   sessions.delete(uid);
 }
 
-// ====== Endpoints ======
-app.get("/", (req, res) => {
-  res.type("text").send("shei-ki webhook is running. Use /health or POST /webhook");
-});
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    sessions: sessions.size,
-    time: new Date().toISOString(),
-  });
-});
+// ===== Endpoints =====
+app.get("/", (req, res) => res.send("OK"));
+app.get("/health", (req, res) => res.json({ ok: true, sessions: sessions.size, time: new Date().toISOString() }));
 
 app.post("/webhook", async (req, res) => {
   const key = String(req.query.key || "");
@@ -212,7 +195,6 @@ app.post("/webhook", async (req, res) => {
   const body = req.body || {};
   const uid = body.uid ? String(body.uid).trim().toUpperCase() : "";
 
-  // Log mínimo para debug
   console.log("📩 Webhook recibido:", {
     uid,
     fecha: body.fecha,
@@ -224,11 +206,8 @@ app.post("/webhook", async (req, res) => {
 
   if (!uid) return res.status(400).send("Missing uid");
 
-  // Deduplicación por (uid+fecha+hora) o por timestamp
   const eventId = `${uid}|${body.fecha || ""}|${body.hora || ""}|${body.nombre || ""}|${body.matricula || ""}`;
-  if (recentEvents.has(eventId)) {
-    return res.status(200).send("OK (duplicate ignored)");
-  }
+  if (recentEvents.has(eventId)) return res.status(200).send("OK (duplicate ignored)");
   recentEvents.set(eventId, Date.now());
 
   const tsFromSheet = (body.fecha && body.hora) ? parseFechaHoraToMs(body.fecha, body.hora) : null;
@@ -253,7 +232,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ====== Admin UI ======
+// ===== Admin UI =====
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isChatInputCommand() && interaction.commandName === "sesiones") {
@@ -321,25 +300,18 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// v15 friendly
+// v15-friendly
 client.once(Events.ClientReady, () => console.log(`✅ Bot listo: ${client.user.tag}`));
 client.login(process.env.DISCORD_TOKEN);
 
+// Railway PORT
 const port = Number(process.env.PORT || 3000);
 const server = app.listen(port, () => console.log(`✅ HTTP listo en :${port} (POST /webhook, GET /health)`));
 
-// Graceful shutdown (Railway sends SIGTERM on deploy/restart)
-async function shutdown(signal) {
-  try {
-    console.log(`\n🧹 Recibido ${signal}. Cerrando...`);
-    server.close(() => console.log("✅ HTTP cerrado"));
-    await client.destroy();
-  } catch (e) {
-    console.error("Error en shutdown:", e?.message || e);
-  } finally {
-    process.exit(0);
-  }
+// Graceful shutdown (Railway)
+function shutdown() {
+  console.log("🛑 Shutting down...");
+  server.close(() => process.exit(0));
 }
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
