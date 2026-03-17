@@ -1,19 +1,7 @@
-# Usa Node LTS (estable)
-FROM node:20-slim
-
+FROM node:20-alpine
 WORKDIR /app
-
-# Copia archivos de dependencias primero (mejor cache)
 COPY package*.json ./
-
-# Instala solo dependencias de producción (más rápido y estable)
-RUN npm ci --omit=dev --no-audit --no-fund --progress=false
-
-# Copia el resto del proyecto
+RUN npm ci --omit=dev
 COPY . .
-
-# Railway usa PORT, nosotros lo respetamos en index.js
 ENV NODE_ENV=production
-EXPOSE 3000
-
-CMD ["npm", "start"]
+CMD ["npm","start"]
