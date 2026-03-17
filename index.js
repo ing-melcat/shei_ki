@@ -28,6 +28,31 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID;
 const WEBHOOK_KEY = process.env.WEBHOOK_KEY || "";
 
+// Apps Script doPost endpoint to update the "Sesiones" sheet (optional but recommended)
+// Example: https://script.google.com/macros/s/XXXXX/exec?key=mi_clave_secreta
+const SESSIONS_POST_URL = (process.env.SESSIONS_POST_URL || "").trim();
+
+// Redis persistence (optional). In Railway, add a Redis DB and set REDIS_URL from it.
+const REDIS_URL = (process.env.REDIS_URL || "").trim();
+const REDIS_KEY = "rur:sessions:v1";
+let redis = null;
+if (REDIS_URL) {
+  try {
+    const Redis = require("ioredis");
+    redis = new Redis(REDIS_URL, {
+      maxRetriesPerRequest: 2,
+      enableReadyCheck: true,
+    });
+    redis.on("error", (e) => console.warn("⚠️ Redis error:", e?.message || e));
+    console.log("🧠 Redis habilitado");
+  } catch (e) {
+    console.warn("⚠️ Redis NO disponible:", e?.message || e);
+    redis = null;
+  }
+} else {
+  console.log("🧠 Redis NO configurado (sin persistencia)." );
+}
+
 // ===== Estado =====
 const sessions = new Map(); // uid -> session
 const recentEvents = new Map(); // dedupe
@@ -127,6 +152,128 @@ function scheduleReminders(uid) {
   }, 3 * 60 * 60 * 1000);
 }
 
+// ===== Helpers: Sheets (Sesiones) =====
+async function postSessionToSheets(payload) {
+  if (!SESSIONS_POST_URL) return;
+  try {
+    const r = await fetch(SESSIONS_POST_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      redirect: "follow",
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      console.warn("⚠️ Sheets update failed:", r.status, t.slice(0, 200));
+    }
+  } catch (e) {
+    console.warn("⚠️ Sheets update error:", e?.message || e);
+  }
+}
+
+// ===== Helpers: Redis persistence =====
+function storableSession(s) {
+  return {
+    uid: s.uid,
+    nombre: s.nombre || "",
+    matricula: s.matricula || "",
+    discordId: s.discordId || "",
+    startMs: Number(s.startMs || Date.now()),
+    lastMs: Number(s.lastMs || Date.now()),
+  };
+}
+
+async function persistSession(uid) {
+  if (!redis) return;
+  const s = sessions.get(uid);
+  if (!s) return;
+  await redis.hset(REDIS_KEY, uid, JSON.stringify(storableSession(s))).catch(() => {});
+}
+
+async function removePersistedSession(uid) {
+  if (!redis) return;
+  await redis.hdel(REDIS_KEY, uid).catch(() => {});
+}
+
+function scheduleRemindersFromStart(uid) {
+  // Re-schedule reminders using remaining time since start
+  const s = sessions.get(uid);
+  if (!s) return;
+
+  clearTimers(s);
+  const now = Date.now();
+  const elapsed = Math.max(0, now - (s.startMs || now));
+  const t2 = 2 * 60 * 60 * 1000;
+  const t3 = 3 * 60 * 60 * 1000;
+
+  const wait2 = Math.max(0, t2 - elapsed);
+  const wait3 = Math.max(0, t3 - elapsed);
+
+  s.t2h = setTimeout(async () => {
+    const cur = sessions.get(uid);
+    if (!cur) return;
+    await dm(
+      cur.discordId,
+      `⏰ Recordatorio: tu sesión sigue activa desde hace **2 horas**.\n` +
+        `Pasa tu tarjeta para cerrar.\n` +
+        `Si no puedes pasarla, comunícate con un administrador de la RUR para cerrar tu sesión.`
+    );
+  }, wait2);
+
+  s.t3h = setTimeout(async () => {
+    const cur = sessions.get(uid);
+    if (!cur) return;
+
+    await dm(
+      cur.discordId,
+      `⚠️ Tu sesión sigue activa desde hace **3 horas**.\n` +
+        `Pasa tu tarjeta o comunícate con un administrador de la RUR para cerrar tu sesión.`
+    );
+
+    s.t30m = setInterval(async () => {
+      const again = sessions.get(uid);
+      if (!again) return;
+      await dm(
+        again.discordId,
+        `⚠️ Recordatorio (cada 30 min): tu sesión sigue activa.\n` +
+          `Comunícate con un administrador de la RUR para cerrar tu sesión si no puedes pasar tu tarjeta.`
+      );
+    }, 30 * 60 * 1000);
+  }, wait3);
+}
+
+async function restoreSessions() {
+  if (!redis) return;
+  try {
+    const data = await redis.hgetall(REDIS_KEY);
+    const uids = Object.keys(data || {});
+    if (!uids.length) {
+      console.log("🧠 Redis: no había sesiones guardadas.");
+      return;
+    }
+    for (const uid of uids) {
+      try {
+        const s = JSON.parse(data[uid]);
+        sessions.set(uid, {
+          uid,
+          nombre: s.nombre || "",
+          matricula: s.matricula || "",
+          discordId: s.discordId || "",
+          startMs: Number(s.startMs || Date.now()),
+          lastMs: Number(s.lastMs || s.startMs || Date.now()),
+          t2h: null,
+          t3h: null,
+          t30m: null,
+        });
+        scheduleRemindersFromStart(uid);
+      } catch {}
+    }
+    console.log(`🧠 Redis: sesiones restauradas: ${sessions.size}`);
+  } catch (e) {
+    console.warn("⚠️ Redis restore error:", e?.message || e);
+  }
+}
+
 async function openSession({ uid, nombre, matricula, discordId, timestampMs, fecha, hora }) {
   sessions.set(uid, {
     uid,
@@ -141,6 +288,20 @@ async function openSession({ uid, nombre, matricula, discordId, timestampMs, fec
   });
 
   scheduleReminders(uid);
+  await persistSession(uid);
+
+  // Update Sheet "Sesiones" (active=TRUE)
+  await postSessionToSheets({
+    uid,
+    nombre: nombre || "",
+    matricula: matricula || "",
+    discordId: discordId || "",
+    startMs: timestampMs,
+    endMs: 0,
+    active: true,
+    closedBy: "",
+    reason: "",
+  });
 
   const whenText = fecha && hora ? `${fecha} ${hora}` : `<t:${Math.floor(timestampMs / 1000)}:F>`;
   const embed = new EmbedBuilder()
@@ -163,6 +324,19 @@ async function closeSession(uid, closedBy, reason = "") {
   const endMs = s.lastMs || Date.now();
   const dur = fmtDuration(endMs - s.startMs);
 
+  // Update Sheet "Sesiones" (active=FALSE)
+  await postSessionToSheets({
+    uid,
+    nombre: s.nombre || "",
+    matricula: s.matricula || "",
+    discordId: s.discordId || "",
+    startMs: s.startMs || 0,
+    endMs,
+    active: false,
+    closedBy,
+    reason: closedBy === "admin" ? (reason || "") : "",
+  });
+
   const embed = new EmbedBuilder()
     .setTitle("✅ CIERRE DE SESIÓN")
     .addFields(
@@ -179,6 +353,7 @@ async function closeSession(uid, closedBy, reason = "") {
 
   await postLog(embed);
   sessions.delete(uid);
+  await removePersistedSession(uid);
 }
 
 // ===== Endpoints =====
@@ -223,6 +398,7 @@ app.post("/webhook", async (req, res) => {
     } else {
       const s = sessions.get(uid);
       s.lastMs = timestampMs;
+      await persistSession(uid);
       await closeSession(uid, "user");
     }
     return res.status(200).send("OK");
@@ -301,15 +477,17 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // v15-friendly
-client.once(Events.ClientReady, () => console.log(`✅ Bot listo: ${client.user.tag}`));
+client.once(Events.ClientReady, async () => {
+  console.log(`✅ Bot listo: ${client.user.tag}`);
+  await restoreSessions();
+});
 client.login(process.env.DISCORD_TOKEN);
 
 // Railway PORT
 const port = Number(process.env.PORT || 3000);
-
-const server = app.listen(port, "0.0.0.0", () => {
-  console.log(`✅ HTTP listo en :${port} (POST /webhook, GET /health)`);
-});
+const server = app.listen(port, "0.0.0.0", () =>
+  console.log(`✅ HTTP listo en :${port} (POST /webhook, GET /health)`)
+);
 
 // Graceful shutdown (Railway)
 function shutdown() {

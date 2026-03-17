@@ -28,11 +28,16 @@ It only posts to Discord when it receives a POST request from your Google Apps S
 In Railway → Service → Variables, add:
 
 - `DISCORD_TOKEN`
-- `APP_ID` (only needed if you run deploy-commands)
+- `APPLICATION_ID` (only needed if you run deploy-commands)
 - `GUILD_ID` (only needed if you run deploy-commands)
 - `LOG_CHANNEL_ID`
 - `ADMIN_CHANNEL_ID`
 - `WEBHOOK_KEY`
+
+Optional (recommended):
+
+- `SESSIONS_POST_URL` (Apps Script doPost URL to write to the "Sesiones" sheet)
+- `REDIS_URL` (add a Railway Redis database and reference its REDIS_URL here)
 
 > Railway provides `PORT` automatically.
 
@@ -71,5 +76,6 @@ Make sure `DISCORD_TOKEN`, `APP_ID`, `GUILD_ID` are set in your local `.env`.
 ## Notes (important)
 
 - Sessions are stored **in memory**. If Railway restarts, active sessions are lost.
-  For 24/7 production, add Redis/Postgres and persist sessions.
+- By default sessions are stored **in memory**. For 24/7 production, add Redis and set `REDIS_URL`.
+- If you want the sheet "Sesiones" to show active sessions, set `SESSIONS_POST_URL`.
 - Keep `WEBHOOK_KEY` secret.
