@@ -306,7 +306,10 @@ client.login(process.env.DISCORD_TOKEN);
 
 // Railway PORT
 const port = Number(process.env.PORT || 3000);
-const server = app.listen(port, () => console.log(`✅ HTTP listo en :${port} (POST /webhook, GET /health)`));
+
+const server = app.listen(port, "0.0.0.0", () => {
+  console.log(`✅ HTTP listo en :${port} (POST /webhook, GET /health)`);
+});
 
 // Graceful shutdown (Railway)
 function shutdown() {
