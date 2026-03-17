@@ -1,6 +1,6 @@
 # Node LTS (estable)
 FROM node:20-slim
-
+WORKDIR /app
 # Copia archivos de dependencias primero (mejor cache)
 COPY package*.json ./
 
