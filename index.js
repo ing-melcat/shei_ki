@@ -19,7 +19,6 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "256kb" }));
 
-// ===== Discord =====
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
   partials: [Partials.Channel],
@@ -29,47 +28,27 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID;
 const WEBHOOK_KEY = process.env.WEBHOOK_KEY || "";
 
-// Apps Script (doPost) para Sesiones
-const SESSIONS_POST_URL = (process.env.SESSIONS_POST_URL || "").trim();
-
-// ===== Redis (persistencia) =====
-let redis = null;
-const REDIS_URL = (process.env.REDIS_URL || "").trim();
-const REDIS_SESSIONS_KEY = "rur:sessions:active:v1";
-
-if (REDIS_URL) {
-  try {
-    const Redis = require("ioredis");
-    redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
-    redis.on("error", (e) => console.warn("⚠️ Redis error:", e?.message || e));
-    console.log("🧠 Redis habilitado");
-  } catch (e) {
-    console.warn("⚠️ Redis deshabilitado:", e?.message || e);
-    redis = null;
-  }
-} else {
-  console.log("🧠 Redis NO configurado (sin persistencia).");
-}
-
 // ===== Estado =====
 const sessions = new Map(); // uid -> session
-const recentEvents = new Map();
+const recentEvents = new Map(); // dedupe
 const DEDUPE_WINDOW_MS = 15_000;
 
-setInterval(() => {
+function cleanupDedupe() {
   const now = Date.now();
   for (const [k, t] of recentEvents.entries()) {
     if (now - t > DEDUPE_WINDOW_MS) recentEvents.delete(k);
   }
-}, 10_000).unref();
+}
+setInterval(cleanupDedupe, 10_000).unref();
 
-// ===== Helpers =====
 function fmtDuration(ms) {
   const total = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
-  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+  return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s
+    .toString()
+    .padStart(2, "0")}`;
 }
 
 function parseFechaHoraToMs(fecha, hora) {
@@ -89,85 +68,79 @@ async function getLogChannel() {
 
 async function postLog(embed) {
   const ch = await getLogChannel();
-  if (!ch) return console.warn("⚠️ No pude obtener canal logs (LOG_CHANNEL_ID/permisos).");
-  await ch.send({ embeds: [embed] }).catch(e => console.warn("⚠️ send embed:", e?.message || e));
-}
-
-// ===== Sheets doPost =====
-async function postSessionToSheets(payload) {
-  if (!SESSIONS_POST_URL) return;
-  try {
-    const r = await fetch(SESSIONS_POST_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      redirect: "follow",
-    });
-    const t = await r.text();
-    if (!r.ok) console.warn("⚠️ Sheets doPost fail:", r.status, t);
-  } catch (e) {
-    console.warn("⚠️ Sheets doPost error:", e?.message || e);
+  if (!ch) {
+    console.warn("⚠️ No pude obtener canal logs. Revisa LOG_CHANNEL_ID y permisos.");
+    return;
   }
+  await ch.send({ embeds: [embed] }).catch((e) => console.error("❌ send error:", e?.message || e));
 }
 
-// ===== Redis persistence =====
-function sessionToStorable(s) {
-  return {
-    uid: s.uid,
-    nombre: s.nombre || "",
-    matricula: s.matricula || "",
-    discordId: s.discordId || "",
-    startMs: Number(s.startMs || Date.now()),
-    lastMs: Number(s.lastMs || Date.now()),
-  };
+async function dm(discordId, text) {
+  if (!discordId) return;
+  const user = await client.users.fetch(discordId).catch(() => null);
+  if (user) await user.send(text).catch(() => null);
 }
 
-async function persistOne(uid) {
-  if (!redis) return;
+function clearTimers(s) {
+  if (s.t2h) clearTimeout(s.t2h);
+  if (s.t3h) clearTimeout(s.t3h);
+  if (s.t30m) clearInterval(s.t30m);
+  s.t2h = s.t3h = s.t30m = null;
+}
+
+function scheduleReminders(uid) {
   const s = sessions.get(uid);
   if (!s) return;
-  await redis.hset(REDIS_SESSIONS_KEY, uid, JSON.stringify(sessionToStorable(s))).catch(() => {});
+
+  clearTimers(s);
+
+  s.t2h = setTimeout(async () => {
+    const cur = sessions.get(uid);
+    if (!cur) return;
+    await dm(
+      cur.discordId,
+      `⏰ Recordatorio: tu sesión sigue activa desde hace **2 horas**.\n` +
+        `Pasa tu tarjeta para cerrar.\n` +
+        `Si no puedes pasarla, comunícate con un administrador de la RUR para cerrar tu sesión.`
+    );
+  }, 2 * 60 * 60 * 1000);
+
+  s.t3h = setTimeout(async () => {
+    const cur = sessions.get(uid);
+    if (!cur) return;
+
+    await dm(
+      cur.discordId,
+      `⚠️ Tu sesión sigue activa desde hace **3 horas**.\n` +
+        `Pasa tu tarjeta o comunícate con un administrador de la RUR para cerrar tu sesión.`
+    );
+
+    s.t30m = setInterval(async () => {
+      const again = sessions.get(uid);
+      if (!again) return;
+      await dm(
+        again.discordId,
+        `⚠️ Recordatorio (cada 30 min): tu sesión sigue activa.\n` +
+          `Comunícate con un administrador de la RUR para cerrar tu sesión si no puedes pasar tu tarjeta.`
+      );
+    }, 30 * 60 * 1000);
+  }, 3 * 60 * 60 * 1000);
 }
 
-async function removePersisted(uid) {
-  if (!redis) return;
-  await redis.hdel(REDIS_SESSIONS_KEY, uid).catch(() => {});
-}
-
-async function restoreSessionsFromRedis() {
-  if (!redis) return;
-  const data = await redis.hgetall(REDIS_SESSIONS_KEY).catch(() => ({}));
-  const uids = Object.keys(data || {});
-  if (!uids.length) return console.log("🧠 Redis: no había sesiones guardadas.");
-
-  for (const uid of uids) {
-    try {
-      const p = JSON.parse(data[uid]);
-      sessions.set(uid, { ...p });
-    } catch {}
-  }
-  console.log(`🧠 Redis: sesiones restauradas: ${sessions.size}`);
-}
-
-// ===== Session logic =====
 async function openSession({ uid, nombre, matricula, discordId, timestampMs, fecha, hora }) {
   sessions.set(uid, {
-    uid, nombre, matricula, discordId,
+    uid,
+    nombre,
+    matricula,
+    discordId,
     startMs: timestampMs,
-    lastMs: timestampMs
+    lastMs: timestampMs,
+    t2h: null,
+    t3h: null,
+    t30m: null,
   });
 
-  await persistOne(uid);
-
-  // escribir Sesiones (Activa=TRUE)
-  await postSessionToSheets({
-    uid, nombre, matricula, discordId,
-    startMs: timestampMs,
-    endMs: 0,
-    active: true,
-    closedBy: "",
-    reason: ""
-  });
+  scheduleReminders(uid);
 
   const whenText = fecha && hora ? `${fecha} ${hora}` : `<t:${Math.floor(timestampMs / 1000)}:F>`;
   const embed = new EmbedBuilder()
@@ -185,21 +158,10 @@ async function closeSession(uid, closedBy, reason = "") {
   const s = sessions.get(uid);
   if (!s) return;
 
+  clearTimers(s);
+
   const endMs = s.lastMs || Date.now();
   const dur = fmtDuration(endMs - s.startMs);
-
-  // escribir Sesiones (Activa=FALSE)
-  await postSessionToSheets({
-    uid,
-    nombre: s.nombre || "",
-    matricula: s.matricula || "",
-    discordId: s.discordId || "",
-    startMs: s.startMs,
-    endMs: endMs,
-    active: false,
-    closedBy,
-    reason: reason || ""
-  });
 
   const embed = new EmbedBuilder()
     .setTitle("✅ CIERRE DE SESIÓN")
@@ -216,22 +178,32 @@ async function closeSession(uid, closedBy, reason = "") {
   }
 
   await postLog(embed);
-
   sessions.delete(uid);
-  await removePersisted(uid);
 }
 
-// ===== HTTP endpoints =====
-app.get("/health", (req, res) => {
-  res.json({ ok: true, sessions: sessions.size, redis: !!redis, time: new Date().toISOString() });
-});
+// ===== Endpoints =====
+app.get("/", (req, res) => res.send("OK"));
+app.get("/health", (req, res) => res.json({ ok: true, sessions: sessions.size, time: new Date().toISOString() }));
 
 app.post("/webhook", async (req, res) => {
   const key = String(req.query.key || "");
-  if (WEBHOOK_KEY && key !== WEBHOOK_KEY) return res.status(403).send("Forbidden");
+  if (WEBHOOK_KEY && key !== WEBHOOK_KEY) {
+    console.warn("🚫 Webhook Forbidden (bad key) from", req.ip);
+    return res.status(403).send("Forbidden");
+  }
 
   const body = req.body || {};
   const uid = body.uid ? String(body.uid).trim().toUpperCase() : "";
+
+  console.log("📩 Webhook recibido:", {
+    uid,
+    fecha: body.fecha,
+    hora: body.hora,
+    nombre: body.nombre,
+    matricula: body.matricula,
+    hasDiscordId: !!body.discordId,
+  });
+
   if (!uid) return res.status(400).send("Missing uid");
 
   const eventId = `${uid}|${body.fecha || ""}|${body.hora || ""}|${body.nombre || ""}|${body.matricula || ""}`;
@@ -251,33 +223,32 @@ app.post("/webhook", async (req, res) => {
     } else {
       const s = sessions.get(uid);
       s.lastMs = timestampMs;
-      await persistOne(uid);
       await closeSession(uid, "user");
     }
     return res.status(200).send("OK");
   } catch (e) {
-    console.error("❌ webhook error:", e?.message || e);
+    console.error("❌ Error procesando webhook:", e?.message || e);
     return res.status(500).send("Error");
   }
 });
 
-// ===== Discord Admin UI (/sesiones cerrar) =====
+// ===== Admin UI =====
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isChatInputCommand() && interaction.commandName === "sesiones") {
       if (interaction.channelId !== ADMIN_CHANNEL_ID) {
-        return interaction.reply({ content: "Usa este comando en el canal admin.", flags: 64 });
+        return interaction.reply({ content: "Usa este comando en el canal admin.", ephemeral: true });
       }
       if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return interaction.reply({ content: "No tienes permisos.", flags: 64 });
+        return interaction.reply({ content: "No tienes permisos.", ephemeral: true });
       }
 
       const items = Array.from(sessions.entries()).slice(0, 25);
-      if (!items.length) return interaction.reply({ content: "No hay sesiones activas.", flags: 64 });
+      if (!items.length) return interaction.reply({ content: "No hay sesiones activas.", ephemeral: true });
 
       const menu = new StringSelectMenuBuilder()
         .setCustomId("close_session_select")
-        .setPlaceholder("Selecciona una sesión activa…")
+        .setPlaceholder("Selecciona una sesión activa...")
         .addOptions(
           items.map(([uid, s]) => ({
             label: `${s.nombre || "Sin nombre"} / ${s.matricula || "Sin matrícula"}`.slice(0, 100),
@@ -287,10 +258,7 @@ client.on("interactionCreate", async (interaction) => {
         );
 
       const row = new ActionRowBuilder().addComponents(menu);
-      const embed = new EmbedBuilder()
-        .setTitle("Sesiones activas")
-        .setDescription("Selecciona una sesión para cerrarla (admin).");
-
+      const embed = new EmbedBuilder().setTitle("Sesiones activas").setDescription("Selecciona una para cerrarla (admin).");
       return interaction.reply({ embeds: [embed], components: [row] });
     }
 
@@ -317,29 +285,33 @@ client.on("interactionCreate", async (interaction) => {
       const reason = interaction.fields.getTextInputValue("reason");
 
       if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return interaction.reply({ content: "No tienes permisos.", flags: 64 });
+        return interaction.reply({ content: "No tienes permisos.", ephemeral: true });
       }
 
       const s = sessions.get(uid);
       if (s) s.lastMs = Date.now();
 
       await closeSession(uid, "admin", reason);
-      return interaction.reply({ content: `Sesión cerrada (UID ${uid}).`, flags: 64 });
+      return interaction.reply({ content: `Sesión cerrada (UID ${uid}).`, ephemeral: true });
     }
   } catch (e) {
     console.error(e);
-    if (!interaction.replied && !interaction.deferred) {
-      interaction.reply({ content: "Error interno.", flags: 64 }).catch(() => {});
-    }
+    if (!interaction.replied) interaction.reply({ content: "Error interno.", ephemeral: true }).catch(() => {});
   }
 });
 
-client.once(Events.ClientReady, async () => {
-  console.log(`✅ Bot listo: ${client.user.tag}`);
-  await restoreSessionsFromRedis();
-});
+// v15-friendly
+client.once(Events.ClientReady, () => console.log(`✅ Bot listo: ${client.user.tag}`));
 client.login(process.env.DISCORD_TOKEN);
 
-// ===== Listen (Railway uses PORT) =====
+// Railway PORT
 const port = Number(process.env.PORT || 3000);
-app.listen(port, "0.0.0.0", () => console.log(`✅ HTTP listo en :${port}`));
+const server = app.listen(port, () => console.log(`✅ HTTP listo en :${port} (POST /webhook, GET /health)`));
+
+// Graceful shutdown (Railway)
+function shutdown() {
+  console.log("🛑 Shutting down...");
+  server.close(() => process.exit(0));
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);

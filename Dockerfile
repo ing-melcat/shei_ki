@@ -1,7 +1,20 @@
-FROM node:20-alpine
+# Node LTS (estable)
+FROM node:20-slim
+
 WORKDIR /app
+
+# Copia archivos de dependencias primero (mejor cache)
 COPY package*.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+
+# Instalación robusta en CI/containers:
+# - npm install NO requiere package-lock (a diferencia de npm ci)
+# - omit dev deps para producción
+RUN npm install --omit=dev --no-audit --no-fund --progress=false
+
+# Copia el resto del proyecto
 COPY . .
+
 ENV NODE_ENV=production
-CMD ["npm","start"]
+EXPOSE 3000
+
+CMD ["npm", "start"]
